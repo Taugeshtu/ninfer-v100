@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "cutlass-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773723521,
+        "narHash": "sha256-0q9Ad0Z6E/rO2PdM4uQc8H0E0qs9uKc3reHepiHhjEc=",
+        "owner": "nvidia",
+        "repo": "cutlass",
+        "rev": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nvidia",
+        "ref": "v4.4.2",
+        "repo": "cutlass",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1790046670,
+        "narHash": "sha256-MYiI+CzL0tuWgRPjGsKCDHqYs2T3OzMlMQWOYWG0qso=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "cutlass-src": "cutlass-src",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
