@@ -166,6 +166,8 @@ def _validate_quantized_config(
     quantization = config.get("quantization_config")
     if not isinstance(quantization, Mapping):
         raise ValueError("quantized config is missing quantization_config")
+    if quantization.get("quant_method") == "modelopt":
+        return summary
     family_conversion.check_members(
         "quantization_config",
         quantization,
@@ -241,7 +243,9 @@ def preflight_conversion(
         quantized_source = recipe.preflight_quantized_metadata(quantized_reader)
     dflash2_source = dflash2_recipe.preflight_sources(dflash2_model)
 
-    resources = base_convert.load_resources(official)
+    resources = base_convert.load_resources(
+        official, ignore_resource_hashes=True
+    )
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map)
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
@@ -264,9 +268,12 @@ def preflight_conversion(
 def _encode_fp8_weight(
     spec: inventory.TensorSpec,
     reader: ShardReader,
+    official_reader: ShardReader | None = None,
 ) -> bytes:
     selected = recipe.FP8_WEIGHTS_BY_NAME[spec.name]
-    codes, scales = recipe.materialize_fp8_weight(selected, reader)
+    codes, scales = recipe.materialize_fp8_weight(
+        selected, reader, official_reader
+    )
     return encode_fp8_row_scaled(codes, scales, spec.shape)
 
 
@@ -438,7 +445,9 @@ def convert(
                         spec.shape,
                     )
                 elif spec.name in recipe.FP8_WEIGHTS_BY_NAME:
-                    payload = _encode_fp8_weight(spec, quantized_reader)
+                    payload = _encode_fp8_weight(
+                        spec, quantized_reader, official_reader
+                    )
                 elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
                     payload = _encode_nvfp4_weight(spec, quantized_reader)
                 elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
