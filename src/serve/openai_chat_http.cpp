@@ -4,6 +4,8 @@
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -245,6 +247,183 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         error.type    = "internal_error";
         error.message = exception.what();
         write_openai_error(res, error);
+    }
+}
+
+void HttpServer::handle_completions(const httplib::Request& req, httplib::Response& res) {
+    RequestJson body;
+    GenerationRequest request;
+    std::string model;
+    bool stream = false;
+    try {
+        body               = parse_json_body(req);
+        model              = body.value("model", public_model_id_);
+        validate_openai_model(model, public_model_id_);
+        request.raw_output = true;
+        request.max_tokens = body.value("max_tokens", options_.default_max_tokens);
+        stream             = body.value("stream", false);
+
+        if (body.contains("prompt") && !body["prompt"].is_null()) {
+            const auto& p = body["prompt"];
+            if (p.is_array() && !p.empty() && p[0].is_number_integer()) {
+                request.raw_tokens = p.get<std::vector<ninfer::TokenId>>();
+            } else if (p.is_string()) {
+                request.raw_tokens = service_->tokenize_text(p.get<std::string>());
+            }
+        } else {
+            request.raw_tokens = std::vector<ninfer::TokenId>{};
+        }
+
+        if (body.contains("temperature") && !body["temperature"].is_null()) {
+            request.sampling.temperature = body["temperature"].get<double>();
+        }
+        if (body.contains("top_p") && !body["top_p"].is_null()) {
+            request.sampling.top_p = body["top_p"].get<double>();
+        }
+        if (body.contains("stop") && !body["stop"].is_null()) {
+            if (body["stop"].is_string()) {
+                request.stop_strings.push_back(body["stop"].get<std::string>());
+            } else if (body["stop"].is_array()) {
+                for (const auto& s : body["stop"]) {
+                    if (s.is_string()) { request.stop_strings.push_back(s.get<std::string>()); }
+                }
+            }
+        }
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    } catch (const std::exception& e) {
+        ApiError err{.status = 400, .message = e.what()};
+        write_openai_error(res, err);
+        return;
+    }
+
+    const std::uint64_t req_id = ++request_seq_;
+    const RequestLogMetadata metadata{.model                  = model,
+                                      .stream                 = stream,
+                                      .output_tokens_explicit = body.contains("max_tokens")};
+    PreparedRequest prepared;
+    try {
+        prepared = service_->prepare(request,
+                                     stream ? GenerationConsumerMode::Streaming
+                                            : GenerationConsumerMode::Aggregate,
+                                     {}, [&req] { return client_disconnected(req); });
+    } catch (const ApiException& ex) {
+        write_openai_error(res, ex.error());
+        return;
+    } catch (const std::exception& ex) {
+        ApiError err{.status = 500, .message = ex.what()};
+        write_openai_error(res, err);
+        return;
+    }
+
+    auto lifecycle = begin_request(
+        make_request_log_context(req_id, "openai_completions", request, metadata, prepared));
+
+    if (!stream) {
+        GenerationOutcome outcome;
+        try {
+            outcome =
+                service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+        } catch (const std::exception& ex) {
+            lifecycle->failure(
+                make_internal_request_failure(RequestFailurePhase::Generation, ex.what()));
+            ApiError err{.status = 500, .message = ex.what()};
+            write_openai_error(res, err);
+            return;
+        }
+        lifecycle->done(outcome);
+
+        const char* finish =
+            outcome.finish_reason == ninfer::FinishReason::OutputLimit ? "length" : "stop";
+        nlohmann::json resp = {
+            {"id", new_openai_completion_id()},
+            {"object", "text_completion"},
+            {"created", unix_time_now()},
+            {"model", model},
+            {"choices", nlohmann::json::array({{{"text", outcome.text},
+                                                {"index", 0},
+                                                {"logprobs", nullptr},
+                                                {"finish_reason", finish},
+                                                {"token_ids", outcome.generated_token_ids}}})},
+            {"usage",
+             {{"prompt_tokens", outcome.prompt_tokens},
+              {"completion_tokens", outcome.completion_tokens},
+              {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}}}};
+        set_owned_json_content(res, resp.dump(), prepared.lifetime);
+        return;
+    }
+
+    try {
+        auto stream_state          = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        const std::string cmpl_id  = new_openai_completion_id();
+        const std::int64_t created = unix_time_now();
+        prepare_sse_response(res);
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, stream_state, lifecycle, cmpl_id, model,
+             created](std::size_t, httplib::DataSink& sink) -> bool {
+                if (stream_state->started.exchange(true, std::memory_order_acq_rel)) {
+                    sink.done();
+                    return true;
+                }
+                SseTransport transport(sink, stream_state->cancelled);
+                StreamSink consumer{
+                    .on_content =
+                        [&](const std::string& delta) {
+                            nlohmann::json chunk = {
+                                {"id", cmpl_id},
+                                {"object", "text_completion"},
+                                {"created", created},
+                                {"model", model},
+                                {"choices", nlohmann::json::array({{{"text", delta},
+                                                                    {"index", 0},
+                                                                    {"logprobs", nullptr},
+                                                                    {"finish_reason", nullptr}}})}};
+                            transport.write("data: " + chunk.dump() + "\n\n");
+                        },
+                    .is_cancelled =
+                        [&] { return stream_state->cancelled.load(std::memory_order_acquire); }};
+
+                GenerationOutcome outcome;
+                try {
+                    outcome =
+                        service_->run(stream_state->prepared, &consumer, consumer.is_cancelled);
+                } catch (const std::exception& ex) {
+                    lifecycle->failure(
+                        make_internal_request_failure(RequestFailurePhase::Generation, ex.what()));
+                    sink.done();
+                    return false;
+                }
+                lifecycle->done(outcome);
+
+                const char* finish =
+                    outcome.finish_reason == ninfer::FinishReason::OutputLimit ? "length" : "stop";
+                nlohmann::json final_chunk = {
+                    {"id", cmpl_id},
+                    {"object", "text_completion"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices", nlohmann::json::array({{{"text", ""},
+                                                        {"index", 0},
+                                                        {"logprobs", nullptr},
+                                                        {"finish_reason", finish}}})}};
+                transport.write("data: " + final_chunk.dump() + "\n\ndata: [DONE]\n\n");
+                sink.done();
+                return true;
+            },
+            [stream_state, lifecycle](bool successful) {
+                stream_state->cancelled.store(true, std::memory_order_release);
+                if (!successful || !stream_state->started.load(std::memory_order_acquire)) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                }
+            });
+    } catch (const std::exception& ex) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, ex.what()));
+        ApiError err{.status = 500, .message = ex.what()};
+        write_openai_error(res, err);
     }
 }
 

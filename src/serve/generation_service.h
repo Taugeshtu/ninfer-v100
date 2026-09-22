@@ -47,6 +47,7 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
+    std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
@@ -116,6 +117,10 @@ public:
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
+    }
+
+    [[nodiscard]] std::vector<ninfer::TokenId> tokenize_text(std::string_view text) const {
+        return engine_->tokenize_text(text);
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,

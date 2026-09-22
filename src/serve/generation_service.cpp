@@ -316,32 +316,38 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     prepared.lifetime = acquire_request_lifetime(deadline_policy);
 
     try {
-        const auto acquisition_started = Clock::now();
-        std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
-        ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
-            });
-        std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
-        const bool protocol_allows_engine_automatic =
-            input.context_cache.allow_engine_automatic_shared_prefixes;
-        input.context_cache = std::move(context_cache);
-        input.context_cache.markers.insert(input.context_cache.markers.end(),
-                                           std::make_move_iterator(protocol_markers.begin()),
-                                           std::make_move_iterator(protocol_markers.end()));
-        input.context_cache.allow_engine_automatic_shared_prefixes =
-            input.context_cache.allow_engine_automatic_shared_prefixes &&
-            protocol_allows_engine_automatic;
-        prepared.acquisition_seconds =
-            std::chrono::duration<double>(Clock::now() - acquisition_started).count();
-        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        const PreparationControl control{
-            .deadline     = prepared.lifetime->deadline,
-            .cancellation = CancellationView(is_cancelled),
-        };
-        ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        ninfer::PreparedPrompt prompt;
+        if (request.raw_tokens) {
+            check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+            prompt = engine_->prepare_tokens(*request.raw_tokens, options_.allow_prefix_reuse);
+        } else {
+            const auto acquisition_started = Clock::now();
+            std::size_t remaining_media_bytes =
+                std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+            ninfer::PromptInput input =
+                to_prompt_input(request, semantics, [&](const ContentPart& part) {
+                    return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
+                                         remaining_media_bytes);
+                });
+            std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
+            const bool protocol_allows_engine_automatic =
+                input.context_cache.allow_engine_automatic_shared_prefixes;
+            input.context_cache = std::move(context_cache);
+            input.context_cache.markers.insert(input.context_cache.markers.end(),
+                                               std::make_move_iterator(protocol_markers.begin()),
+                                               std::make_move_iterator(protocol_markers.end()));
+            input.context_cache.allow_engine_automatic_shared_prefixes =
+                input.context_cache.allow_engine_automatic_shared_prefixes &&
+                protocol_allows_engine_automatic;
+            prepared.acquisition_seconds =
+                std::chrono::duration<double>(Clock::now() - acquisition_started).count();
+            check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+            const PreparationControl control{
+                .deadline     = prepared.lifetime->deadline,
+                .cancellation = CancellationView(is_cancelled),
+            };
+            prompt = engine_->prepare(std::move(input), control);
+        }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
@@ -415,8 +421,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
-    outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.completion_tokens   = static_cast<int>(outcome.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
