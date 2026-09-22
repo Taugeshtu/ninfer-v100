@@ -126,6 +126,7 @@ bool report_has_activity(const ThroughputReport& report) {
 
 const char* endpoint_name(std::string_view path) noexcept {
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
+    if (path == "/v1/completions") { return "openai_completions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
@@ -440,6 +441,10 @@ void HttpServer::register_routes() {
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
+                 });
+    server_.Post("/v1/completions",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_completions(req, res);
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);

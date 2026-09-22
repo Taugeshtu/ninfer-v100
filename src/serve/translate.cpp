@@ -111,6 +111,14 @@ std::string render_tool_definition(const ToolDefinition& tool) {
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities) {
+    if (request.raw_output) {
+        return ResolvedPromptSemantics{
+            .enable_thinking            = false,
+            .reasoning_effort           = std::nullopt,
+            .effective_reasoning_effort = std::nullopt,
+            .preserve_thinking          = false,
+        };
+    }
     ResolvedPromptSemantics result{
         .enable_thinking            = request.enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort           = std::nullopt,
@@ -303,7 +311,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
-    options.output.raw                     = false;
+    options.output.raw                     = request.raw_output;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.stop.strings.reserve(request.stop_strings.size() *

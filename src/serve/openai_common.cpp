@@ -226,6 +226,8 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
 
 std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"); }
 
+std::string new_openai_completion_id() { return chat_identifier("cmpl-"); }
+
 std::string new_openai_chat_tool_call_id() { return chat_identifier("call_"); }
 
 std::string new_openai_request_id() { return responses_identifier("req"); }
