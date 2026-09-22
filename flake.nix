@@ -39,6 +39,7 @@
           pkg-config
           git
           makeWrapper
+          python3
         ];
 
         buildInputs = with pkgs; [
