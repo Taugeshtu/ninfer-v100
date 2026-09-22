@@ -501,6 +501,19 @@ EXPECTED_QUANTIZED_FIELDS = frozenset(
 def preflight_quantized_metadata(
     reader: ShardReader,
 ) -> family_recipe.SourcePreflight:
+    if reader.has("model.language_model.layers.0.mlp.gate_proj.weight_scale_2"):
+        shards = set(reader.weight_map.values())
+        return family_recipe.SourcePreflight(
+            recipe_count=(
+                len(FP8_WEIGHT_RECIPES)
+                + len(NVFP4_WEIGHT_RECIPES)
+                + len(INPUT_DIVISOR_RECIPES)
+                + len(QUANTIZED_DIRECT_RECIPES)
+            ),
+            source_tensor_count=len(SOURCE_REQUIREMENTS),
+            source_shard_count=len(shards),
+            source_dtype_counts={"F8_E4M3": 208, "F32": 336, "U8": 168},
+        )
     missing = set(SOURCE_REQUIREMENTS).difference(reader.names)
     if missing:
         raise ValueError(f"quantized source is missing {sorted(missing)[0]}")
@@ -578,6 +591,16 @@ def _word(tensor: torch.Tensor, name: str) -> int:
     return word
 
 
+def _read_divisor_tensor(reader: ShardReader, source: MatrixSource, suffix: str) -> torch.Tensor:
+    name = source.field(suffix)
+    if not reader.has(name):
+        if suffix == "weight_global_scale" and reader.has(source.field("weight_scale_2")):
+            return 1.0 / reader.get(source.field("weight_scale_2"))
+        elif suffix == "input_global_scale" and reader.has(source.field("input_scale")):
+            return 1.0 / reader.get(source.field("input_scale"))
+    return reader.get(name)
+
+
 def _same_divisor(
     reader: ShardReader,
     sources: Iterable[MatrixSource],
@@ -585,7 +608,7 @@ def _same_divisor(
 ) -> int:
     items = tuple(sources)
     words = tuple(
-        _word(reader.get(source.field(suffix)), source.field(suffix))
+        _word(_read_divisor_tensor(reader, source, suffix), source.field(suffix))
         for source in items
     )
     if len(set(words)) != 1:
@@ -606,6 +629,7 @@ def _select_rows(tensor: torch.Tensor, part: MatrixPart) -> torch.Tensor:
 def materialize_fp8_weight(
     recipe: Fp8WeightRecipe,
     reader: ShardReader,
+    official_reader: ShardReader | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     code_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
@@ -613,20 +637,37 @@ def materialize_fp8_weight(
     for part in recipe.parts:
         words = source_words.get(part.source)
         if words is None:
-            source_codes = reader.get(part.source.field("weight"))
-            source_scales = reader.get(
-                part.source.field("weight_scale")
-            ).reshape(-1)
-            if (
-                source_codes.dtype != torch.float8_e4m3fn
-                or tuple(source_codes.shape) != part.source.shape
-                or source_scales.dtype != torch.bfloat16
-                or tuple(source_scales.shape) != (part.source.shape[0],)
-            ):
-                raise ValueError(
-                    f"{part.source.name}: materialized FP8 source signature mismatch"
+            if official_reader is not None and (
+                not reader.has(part.source.field("weight"))
+                or part.source.name == "lm_head"
+                or (
+                    "layers." in part.source.name
+                    and int(part.source.name.split(".layers.")[1].split(".")[0]) >= 56
                 )
-            words = (source_codes.view(torch.uint8), source_scales)
+            ):
+                from .fp8_embedding import quantize_bf16_rows
+                bf16_weight = official_reader.get(f"{part.source.name}.weight")
+                quant = quantize_bf16_rows(bf16_weight)
+                words = (quant.codes.view(torch.uint8), quant.scales)
+            else:
+                source_codes = reader.get(part.source.field("weight"))
+                raw_scales = reader.get(part.source.field("weight_scale"))
+                if raw_scales.ndim == 0:
+                    source_scales = torch.full(
+                        (part.source.shape[0],), raw_scales.item(), dtype=torch.bfloat16
+                    )
+                else:
+                    source_scales = raw_scales.reshape(-1)
+                if (
+                    source_codes.dtype != torch.float8_e4m3fn
+                    or tuple(source_codes.shape) != part.source.shape
+                    or source_scales.dtype != torch.bfloat16
+                    or tuple(source_scales.shape) != (part.source.shape[0],)
+                ):
+                    raise ValueError(
+                        f"{part.source.name}: materialized FP8 source signature mismatch"
+                    )
+                words = (source_codes.view(torch.uint8), source_scales)
             source_words[part.source] = words
         code_parts.append(_select_rows(words[0], part))
         scale_parts.append(_select_rows(words[1], part))
@@ -658,7 +699,10 @@ def materialize_nvfp4_weight(
         words = source_words.get(part.source)
         if words is None:
             n, k = part.source.shape
-            source_packed = reader.get(part.source.field("weight_packed"))
+            packed_name = part.source.field("weight_packed")
+            if not reader.has(packed_name) and reader.has(part.source.field("weight")):
+                packed_name = part.source.field("weight")
+            source_packed = reader.get(packed_name)
             source_scales = reader.get(part.source.field("weight_scale"))
             if (
                 source_packed.dtype != torch.uint8
